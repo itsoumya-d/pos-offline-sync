@@ -7,7 +7,7 @@ from decimal import Decimal
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .tables import AuditRow, DeviceRow, OrderRow, OutboxRow, ProductRow, StoreRow
+from .tables import AuditRow, DeviceRow, OrderRow, OutboxRow, ProductRow, RecipeIngredientRow, RecipeRow, StoreRow
 
 MAX_ATTEMPTS = 3
 
@@ -156,3 +156,126 @@ class PosSyncService:
             {"at": r.at.isoformat(), "action": r.action, "actor": r.actor, "reference": r.reference, "detail": r.detail}
             for r in rows
         ]
+
+    def create_recipe(
+        self,
+        store_id: int,
+        recipe_code: str,
+        name: str,
+        yield_servings: int,
+        ingredients: list[dict[str, Any]],
+    ) -> RecipeRow:
+        if self.session.get(StoreRow, store_id) is None:
+            raise NotFoundError("store not found")
+        if not recipe_code.strip() or not name.strip() or yield_servings <= 0:
+            raise ValidationError("recipe_code and name required; yield_servings must be positive")
+        if not ingredients:
+            raise ValidationError("recipe must contain at least one ingredient")
+
+        existing = self.session.scalar(
+            select(RecipeRow).where(RecipeRow.store_id == store_id, RecipeRow.recipe_code == recipe_code)
+        )
+        if existing:
+            raise ConflictError(f"recipe with code '{recipe_code}' already exists for store {store_id}")
+
+        recipe = RecipeRow(
+            store_id=store_id,
+            recipe_code=recipe_code,
+            name=name,
+            yield_servings=yield_servings,
+        )
+        self.session.add(recipe)
+        self.session.flush()
+
+        for item in ingredients:
+            sku = str(item.get("ingredient_sku", "")).strip()
+            qty = float(item.get("quantity_per_serving", 0))
+            unit = str(item.get("unit", "grams")).strip()
+            if not sku or qty <= 0:
+                raise ValidationError("valid ingredient_sku and positive quantity_per_serving required")
+            
+            # verify ingredient exists in product inventory
+            prod = self.session.scalar(
+                select(ProductRow).where(ProductRow.store_id == store_id, ProductRow.sku == sku)
+            )
+            if prod is None:
+                raise NotFoundError(f"ingredient sku '{sku}' not registered in store inventory")
+
+            ing_row = RecipeIngredientRow(
+                recipe_id=recipe.id,
+                ingredient_sku=sku,
+                quantity_per_serving=Decimal(str(qty)),
+                unit=unit,
+            )
+            self.session.add(ing_row)
+
+        self._audit("recipe_created", recipe_code, f"name={name} ingredients={len(ingredients)}")
+        self.session.commit()
+        return recipe
+
+    def get_recipe(self, store_id: int, recipe_code: str) -> dict[str, Any]:
+        recipe = self.session.scalar(
+            select(RecipeRow).where(RecipeRow.store_id == store_id, RecipeRow.recipe_code == recipe_code)
+        )
+        if recipe is None:
+            raise NotFoundError(f"recipe '{recipe_code}' not found")
+
+        ings = list(
+            self.session.scalars(
+                select(RecipeIngredientRow).where(RecipeIngredientRow.recipe_id == recipe.id)
+            ).all()
+        )
+        return {
+            "id": recipe.id,
+            "store_id": recipe.store_id,
+            "recipe_code": recipe.recipe_code,
+            "name": recipe.name,
+            "yield_servings": recipe.yield_servings,
+            "ingredients": [
+                {
+                    "sku": ing.ingredient_sku,
+                    "quantity_per_serving": float(ing.quantity_per_serving),
+                    "unit": ing.unit,
+                }
+                for ing in ings
+            ],
+        }
+
+    def deduct_recipe_ingredients(
+        self,
+        store_id: int,
+        recipe_code: str,
+        portions: int,
+    ) -> dict[str, Any]:
+        if portions <= 0:
+            raise ValidationError("portions must be positive")
+
+        recipe_data = self.get_recipe(store_id, recipe_code)
+        deductions = []
+
+        for ing in recipe_data["ingredients"]:
+            sku = ing["sku"]
+            total_required = int(Decimal(str(ing["quantity_per_serving"])) * portions)
+            prod = self.session.scalar(
+                select(ProductRow).where(ProductRow.store_id == store_id, ProductRow.sku == sku)
+            )
+            if prod is None:
+                raise NotFoundError(f"ingredient sku '{sku}' not found in store stock")
+            if prod.stock < total_required:
+                raise ValidationError(f"insufficient stock for ingredient {sku}: required {total_required}, available {prod.stock}")
+
+            prod.stock -= total_required
+            deductions.append({"sku": sku, "deducted": total_required, "remaining_stock": prod.stock})
+
+        self._audit(
+            "recipe_ingredients_deducted",
+            recipe_code,
+            f"portions={portions} ingredients={len(deductions)}",
+        )
+        self.session.commit()
+        return {
+            "recipe_code": recipe_code,
+            "portions_prepared": portions,
+            "deductions": deductions,
+        }
+

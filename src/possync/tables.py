@@ -74,3 +74,26 @@ class AuditRow(Base):
     actor: Mapped[str] = mapped_column(String(120), default="")
     reference: Mapped[str] = mapped_column(String(120), default="")
     detail: Mapped[str] = mapped_column(Text, default="")
+
+
+class RecipeRow(Base):
+    __tablename__ = "recipes"
+    __table_args__ = (UniqueConstraint("store_id", "recipe_code", name="uq_recipe_store_code"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), index=True)
+    recipe_code: Mapped[str] = mapped_column(String(80), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    yield_servings: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class RecipeIngredientRow(Base):
+    __tablename__ = "recipe_ingredients"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recipe_id: Mapped[int] = mapped_column(ForeignKey("recipes.id", ondelete="CASCADE"), index=True)
+    ingredient_sku: Mapped[str] = mapped_column(String(80), index=True)
+    quantity_per_serving: Mapped[float] = mapped_column(Numeric(10, 4))
+    unit: Mapped[str] = mapped_column(String(20), default="grams")
+

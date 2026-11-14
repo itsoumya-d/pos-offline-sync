@@ -44,6 +44,26 @@ class ReconcileIn(BaseModel):
     expected: dict[str, int] = Field(default_factory=dict)
 
 
+class RecipeIngredientIn(BaseModel):
+    ingredient_sku: str
+    quantity_per_serving: float
+    unit: str = "grams"
+
+
+class RecipeIn(BaseModel):
+    store_id: int
+    recipe_code: str
+    name: str
+    yield_servings: int = 1
+    ingredients: list[RecipeIngredientIn]
+
+
+class RecipeDeductIn(BaseModel):
+    store_id: int
+    portions: int
+
+
+
 def create_app(session_factory: sessionmaker = SessionLocal, api_keys: dict[str, str] | None = None, init_database: bool = True) -> FastAPI:
     if init_database:
         init_db()
@@ -126,6 +146,43 @@ def create_app(session_factory: sessionmaker = SessionLocal, api_keys: dict[str,
     @app.get("/audit")
     def audit(session: Session = Depends(db_session), _: str = Depends(admin)) -> dict[str, Any]:
         return {"audit": PosSyncService(session).audit()}
+
+    @app.post("/recipes")
+    def create_recipe(payload: RecipeIn, session: Session = Depends(db_session), actor: str = Depends(admin)) -> dict[str, Any]:
+        try:
+            row = PosSyncService(session, actor).create_recipe(
+                payload.store_id,
+                payload.recipe_code,
+                payload.name,
+                payload.yield_servings,
+                [i.model_dump() for i in payload.ingredients],
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except ConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"id": row.id, "recipe_code": row.recipe_code, "name": row.name}
+
+    @app.get("/recipes/{store_id}/{recipe_code}")
+    def get_recipe(store_id: int, recipe_code: str, session: Session = Depends(db_session), _: str = Depends(viewer)) -> dict[str, Any]:
+        try:
+            return PosSyncService(session).get_recipe(store_id, recipe_code)
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/recipes/{recipe_code}/deduct")
+    def deduct_recipe(recipe_code: str, payload: RecipeDeductIn, session: Session = Depends(db_session), actor: str = Depends(cashier)) -> dict[str, Any]:
+        try:
+            return PosSyncService(session, actor).deduct_recipe_ingredients(
+                payload.store_id, recipe_code, payload.portions
+            )
+        except NotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
 
     return app
 
